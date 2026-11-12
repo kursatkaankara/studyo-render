@@ -1,0 +1,103 @@
+# Stüdyo — video render (HyperFrames). Bu dosyayı Stüdyo uygulaması yazar ve günceller; elle değiştirme.
+# Girdiler ve çıktılar şifrelidir (STUDYO_ANAHTAR secret'ı); taslak sürümlere (draft release) yüklenip indirilir.
+name: studyo-render
+run-name: "studyo ${{ inputs.is_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      is_id:
+        description: "İş kimliği"
+        required: true
+        type: string
+      surum_id:
+        description: "Girdinin bulunduğu taslak sürümün kimliği"
+        required: true
+        type: string
+      parcalar:
+        description: "Parça listesi (JSON)"
+        required: true
+        type: string
+      fps:
+        description: "Kare hızı"
+        required: true
+        type: string
+      kalite:
+        description: "HyperFrames kalite ayarı (boş = varsayılan)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    name: "parça ${{ matrix.parca.no }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: true
+      max-parallel: 20
+      matrix:
+        parca: ${{ fromJSON(inputs.parcalar) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SURUM_ID: ${{ inputs.surum_id }}
+      FPS: ${{ inputs.fps }}
+      KALITE: ${{ inputs.kalite }}
+      NO: ${{ matrix.parca.no }}
+      BAS: ${{ matrix.parca.bas }}
+      SON: ${{ matrix.parca.son }}
+    steps:
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Araçlar (ffmpeg, yazı tipleri, HyperFrames)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-liberation fonts-dejavu-core unzip jq > /dev/null
+          npm install -g --no-fund --no-audit hyperframes@0.9.20 > /dev/null
+          hyperframes browser ensure
+
+      - name: Girdiyi indir ve çöz
+        env:
+          STUDYO_ANAHTAR: ${{ secrets.STUDYO_ANAHTAR }}
+        run: |
+          set -euo pipefail
+          if [ -z "$STUDYO_ANAHTAR" ]; then echo "HATA: STUDYO_ANAHTAR secret'ı yok"; exit 1; fi
+          id=$(gh api "repos/$REPO/releases/$SURUM_ID/assets" --jq '.[] | select(.name=="girdi.zip.enc") | .id')
+          if [ -z "$id" ]; then echo "HATA: girdi.zip.enc bulunamadı"; exit 1; fi
+          gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$id" > girdi.zip.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:STUDYO_ANAHTAR -in girdi.zip.enc -out girdi.zip
+          unzip -q girdi.zip -d is
+          rm -f girdi.zip girdi.zip.enc
+          sure=$(jq -r .ses_sure is/studyo_is.json)
+          ffmpeg -v error -f lavfi -i "anullsrc=r=48000:cl=mono" -t "$sure" -c:a pcm_s16le is/video/assets/ses.wav
+
+      - name: Render
+        run: |
+          set -euo pipefail
+          args=(render is/video --output parca.mp4 --fps "$FPS" --workers auto --quiet)
+          if [ -n "$KALITE" ]; then args+=(--quality "$KALITE"); fi
+          if [ -n "$BAS" ]; then args+=(--start "$BAS"); fi
+          if [ -n "$SON" ]; then args+=(--end "$SON"); fi
+          echo "hyperframes ${args[*]}"
+          hyperframes "${args[@]}"
+          echo "kare sayısı: $(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 parca.mp4)"
+
+      - name: Şifrele ve gönder
+        env:
+          STUDYO_ANAHTAR: ${{ secrets.STUDYO_ANAHTAR }}
+        run: |
+          set -euo pipefail
+          ad=$(printf 'parca_%02d.mp4.enc' "$NO")
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -md sha256 -pass env:STUDYO_ANAHTAR -in parca.mp4 -out "$ad"
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+            --data-binary @"$ad" "https://uploads.github.com/repos/$REPO/releases/$SURUM_ID/assets?name=$ad" > /dev/null
+          echo "gönderildi: $ad"
